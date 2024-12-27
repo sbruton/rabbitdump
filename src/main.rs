@@ -1,11 +1,11 @@
 use chrono::Utc;
+use clap::{ArgGroup, Parser};
 use futures::StreamExt;
 use lapin::types::AMQPValue;
 use lapin::{options::*, types::FieldTable, Connection, ConnectionProperties};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs::OpenOptions;
-use clap::{ArgGroup, Parser};
 use std::io::Write;
 use tokio::time::timeout;
 
@@ -17,20 +17,24 @@ use tokio::time::timeout;
         .args(&["output_json"])
 ))]
 struct Args {
-    #[clap(short = 'a', long="amqp-host", default_value = "localhost")]
+    #[clap(short = 'a', long = "amqp-host", default_value = "localhost")]
     amqp_host: String,
-    #[clap(short='p', long="amqp-port", default_value = "5672")]
+    #[clap(short = 'p', long = "amqp-port", default_value = "5672")]
     amqp_port: u16,
-    #[clap(short='m', long="amqp-mgmt-port", default_value = "15672")]
+    #[clap(short = 'm', long = "amqp-mgmt-port", default_value = "15672")]
     amqp_management_port: u16,
-    #[clap(short='u', long="amqp-user", default_value = "guest")]
+    #[clap(short = 'u', long = "amqp-user", default_value = "guest")]
     amqp_user: String,
-    #[clap(short='P', long="amqp-password", default_value = "guest")]
+    #[clap(short = 'P', long = "amqp-password", default_value = "guest")]
     amqp_password: String,
-    #[clap(long="prefetch", default_value_t = 1000)]
+    #[clap(long = "prefetch", default_value_t = 1000)]
     prefetch_count: u16,
-    #[clap(long="json")]
+    #[clap(long = "json")]
     output_json: bool,
+    #[clap(long = "stdout")]
+    output_stdout: bool,
+    #[clap(short = 's', long = "stream")]
+    stream: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,14 +100,39 @@ async fn main() -> anyhow::Result<()> {
 
     let streams = list_streams(&management_url).await;
 
+    if let Some(stream) = &args.stream {
+        if !streams.contains(stream) {
+            eprintln!("Stream {} not found", stream);
+            eprintln!("Available streams: {:?}", streams);
+            std::process::exit(1);
+        }
+    } else if args.output_stdout {
+        eprintln!("--stdout requires --stream");
+        eprintln!("Available streams: {:?}", streams);
+        std::process::exit(1);
+    }
+
     for stream in streams.iter() {
-        println!("Consuming stream: {}", stream);
-        let filename = format!("{}.{}.stream", stream, ts.to_rfc3339());
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&filename)
-            .expect("Unable to open file");
+        if args.output_stdout {
+            if Some(stream) != args.stream.as_ref() {
+                continue;
+            }
+        } else {
+            println!("Consuming stream: {}", stream);
+        }
+
+        let mut file = if !args.output_stdout {
+            let filename = format!("{}.{}.stream", stream, ts.to_rfc3339());
+            Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&filename)
+                    .expect("Unable to open file"),
+            )
+        } else {
+            None
+        };
 
         let mut consumer = channel
             .basic_consume(stream, "", BasicConsumeOptions::default(), {
@@ -123,24 +152,42 @@ async fn main() -> anyhow::Result<()> {
             timeout(std::time::Duration::from_millis(10_000), consumer.next()).await
         {
             i += 1;
-            print!("\t processing event {i}:");
+
+            if !args.output_stdout {
+                print!("\t processing event {i}:");
+            }
+
             let delivery = delivery?;
 
             let payload = serde_json::from_slice::<serde_json::Value>(&delivery.data).unwrap();
 
-            let event_name = payload.as_object().map(|event| event.get("event").map(|event_name| event_name.as_str().unwrap_or_default())).flatten().unwrap_or_default();
+            let event_name = payload
+                .as_object()
+                .map(|event| {
+                    event
+                        .get("event")
+                        .map(|event_name| event_name.as_str().unwrap_or_default())
+                })
+                .flatten()
+                .unwrap_or_default();
 
-            println!(" {event_name}");
+            if !args.output_stdout {
+                println!(" {event_name}");
+            }
 
-            let output = serde_json::to_vec(&payload).unwrap();
-            file.write_all(&output).expect("Unable to write data");
-            file.write_all(b"\n").expect("Unable to write newline");
+            if let Some(file) = file.as_mut() {
+                let output = serde_json::to_vec(&payload).unwrap();
+                file.write_all(&output).expect("Unable to write data");
+                file.write_all(b"\n").expect("Unable to write newline");
+            } else {
+                let output = serde_json::to_string(&payload).unwrap();
+                println!("{output}");
+            }
 
             delivery
                 .ack(BasicAckOptions::default())
                 .await
                 .expect("Failed to ack send_webhook_event message");
-
         }
     }
 
